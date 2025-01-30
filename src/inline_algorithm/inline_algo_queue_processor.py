@@ -1,0 +1,255 @@
+'''
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+
+---
+
+An implementation of the AbstractInlineAlgorithm to run within a FastAPI server 
+and utilizing a queue to manage events.
+'''
+import json
+from contextlib import asynccontextmanager
+from queue import Queue
+from threading import Thread, Event
+import requests
+from fastapi import FastAPI, Request, APIRouter, Response
+import uvicorn
+from .abstract_inline_algorithm import AbstractInlineAlgorithm
+from .models import ScanStart, ScanOngoing, ScanEnd, ScanAbort, AoiResults, TileResults
+import traceback
+
+
+class InlineAlgoQueueProcessor(AbstractInlineAlgorithm):
+    ''' 
+    Initializes parameters such as port, host, and docker mode, and sets up a queue and
+    an error event for managing a task that will read messages populated in a queue.
+
+    :param int port: The port number the FastAPI app will run on.
+    :param str host: The host address the FastAPI app will bind to
+    :param bool docker_mode: A flag indicating if the application is running in Docker mode.
+    '''
+
+    def __init__(self, port, host, docker_mode=True):
+        self.port = port
+        self.host = host
+        self.docker_mode = docker_mode
+
+        self.__queue = Queue() # A queue to manage API messages.
+        self.__error_event = Event() # An event to handle error states.
+        self.app = FastAPI(lifespan=self.lifespan) # The FastAPI application instance.
+        self.__router = APIRouter() # The FastAPI router for handling routes.
+        self.tile_num = 0
+
+        self.__init_routes()
+
+    def __init_routes(self):
+        self.__router.add_api_route("/v1/scan/start", self.scan_start, methods=["PUT"])
+        self.__router.add_api_route("/v1/scan/end", self.scan_end, methods=["PUT"])
+        self.__router.add_api_route(
+            "/v1/scan/image-tile", self.scan_ongoing, methods=["POST"]
+        )
+        self.__router.add_api_route("/v1/scan/abort", self.scan_abort, methods=["PUT"])
+        self.app.include_router(self.__router)
+
+    @asynccontextmanager
+    async def lifespan(self, app: FastAPI):
+        '''
+        Manages the lifespan of the FastAPI application, ensuring that the
+        API call handler loop runs in a separate thread during the server's 
+        lifetime. The server start and end hooks are also called at appropriate
+        times.  self.on_server_start() will be called on the FastAPI application 
+        startup and self.on_server_end() will be called when the FastAPI application 
+        gracefully shutdown.
+
+        :param obj app: The FastAPI application instance.
+        '''
+        thread_handle = Thread(
+            target=self.api_call_handler_loop,
+            daemon=True,
+        )
+        thread_handle.start()
+        self.on_server_start()
+        yield
+        self.on_server_end()
+
+    async def scan_start(self, params: ScanStart, request: Request):
+        '''
+        Handles the /v1/scan/start API endpoint. This method enqueues the provided
+        scan parameters for processing and returns a response indicating the
+        request was successfully received.
+
+        Refer to the API documentation links at the top of this page for more information.
+
+        :param ScanStart params: The request body for /v1/scan/start.
+        :param Request request: The incoming HTTP request.
+
+        :return: A response object with status code 200.
+        :rtype: Response
+        '''
+        self.__queue.put(params)
+        self.tile_num = 0
+        return Response(status_code=200)
+
+    async def scan_ongoing(self, params: ScanOngoing, request: Request):
+        '''
+        Handles the /v1/scan/image-tile API endpoint. This method enqueues the provided
+        scan parameters for processing and returns a response indicating the
+        request was successfully received.
+
+        Refer to the API documentation links at the top of this page for more information.
+
+        :param ScanOngoing params: The request body for /v1/scan/image-tile.
+        :param Request request: The incoming HTTP request.
+
+        :return: A response object with status code 202.
+        :rtype: Response
+        '''
+        self.__queue.put(params)
+        self.tile_num += 1
+        return Response(status_code=202)
+
+    async def scan_end(self, params: ScanEnd, request: Request):
+        '''
+        Handles the /v1/scan/end API endpoint. This method enqueues the provided
+        scan parameters for processing and returns a response indicating the
+        request was successfully received.
+
+        Refer to the API documentation links at the top of this page for more information.
+
+        :param ScanEnd params: The request body for /v1/scan/end.
+        :param Request request: The incoming HTTP request.
+
+        :return: A response object with status code 204.
+        :rtype: Response
+        '''
+        self.__queue.put(params)
+        print(f"Total tile number: {self.tile_num}")
+        return Response(status_code=204)
+
+    async def scan_abort(self, params: ScanAbort, request: Request):
+        '''
+        Handles the /v1/scan/abort API endpoint. This method enqueues the provided
+        scan parameters for processing and returns a response indicating the
+        request was successfully received.
+
+        Refer to the API documentation links at the top of this page for more information.
+
+        :param ScanAbort params: The request body for /v1/scan/abort.
+        :param Request request: The incoming HTTP request.
+
+        :return: A response object with status code 204.
+        :rtype: Response
+        '''
+        self.__queue.put(params)
+        return Response(status_code=204)
+
+    def api_call_handler_loop(self):
+        '''
+        Continuously handles API calls by processing messages from the queue.
+        Depending on the type of message, it performs the corresponding action such
+        as starting a scan, processing ongoing scan data, ending a scan, or aborting a scan.
+        It also sends appropriate HTTP requests to specified URLs to communicate the results
+        or status updates.
+
+        This method runs in an infinite loop until an exception occurs, setting an error
+        event if an exception is raised.
+
+        Message Types:
+            - ScanStart: Triggers the `on_scan_start` method.
+            - ScanOngoing: Processes tile data and sends results to a specific URL.
+            - ScanEnd: Sends a completion signal to a specific URL and triggers the
+                       `on_scan_end` method.
+            - ScanAbort: Triggers the `on_scan_abort` method.
+
+        :raises BaseException: Any exception encountered during the loop execution.
+        '''
+        with open("/homes/gws/rustin/UW-Med/uw-med-pramana/server_log.txt", "w") as logger:
+            try:
+                while True:
+                    message = self.__queue.get()
+                    logger.write(f"Message: {message}\n\n")
+                    if isinstance(message, ScanStart):
+                        algorithm_id = message.algorithm_id
+                        slide_name = message.slide_name
+                        self.on_scan_start(message)
+                    elif isinstance(message, ScanOngoing):
+                        slide_name = message.slide_name
+                        tile_name = message.tile_name
+                        row_idx = message.row_idx
+                        col_idx = message.col_idx
+                        self.process(message)
+                        results_dict = {
+                            "row_idx": row_idx,
+                            "col_idx": col_idx,
+                        }
+                        results = AoiResults(**results_dict)
+                        data_json = {
+                            "algorithm_id": algorithm_id,
+                            "slide_name": slide_name,
+                            "tile_name": tile_name,
+                            "results": results.dict(by_alias=True),
+                        }
+                        tile_results = TileResults(**data_json)
+                        tile_results_dict = tile_results.dict(by_alias=True)
+                        hostname = (
+                            "host.docker.internal" if self.docker_mode else "localhost"
+                        )
+                        url = f"http://{hostname}:8001/v1/tile-results"
+                        requests.post(url, data=json.dumps(tile_results_dict), timeout=1)
+                    elif isinstance(message, ScanEnd):
+                        data_json = {"algorithm_id": algorithm_id, "slide_name": slide_name}
+                        hostname = (
+                            "host.docker.internal" if self.docker_mode else "localhost"
+                        )
+                        url = f"http://{hostname}:8001/v1/algorithm-completed"
+                        requests.post(url, data=json.dumps(data_json), timeout=1)
+                        self.on_scan_end(message)
+                    elif isinstance(message, ScanAbort):
+                        algorithm_id = ""
+                        slide_name = ""
+                        self.on_scan_abort(message)
+
+            except BaseException as e:
+                self.__error_event.set()
+                logger.write(f"{traceback.format_exc()}\n")
+                logger.write(f"{e}\n\n")
+                raise e
+
+    def run(self):
+        uvicorn.run(
+            self.app,
+            host=self.host,
+            port=self.port,
+        )
+
+    def on_server_start(self):
+        pass
+
+    def on_server_end(self):
+        pass
+
+    def on_scan_start(self, message):
+        pass
+
+    def process(self, message):
+        pass
+
+    def on_scan_end(self, message):
+        pass
+
+    def on_scan_abort(self, message):
+        pass
