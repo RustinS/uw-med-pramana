@@ -184,8 +184,8 @@ class TestChild(InlineAlgoQueueProcessor):
         for mag_level in self.mag_levels:
             combined = list(zip(self.features[mag_level], self.coordinates[mag_level]))
             combined_sorted = sorted(combined, key=lambda item: (item[1][1], item[1][0]))
-            sorted_coordinates, sorted_tensors = zip(*combined_sorted)
-            wsi_emb = torch.cat(sorted_tensors, dim=0)
+            sorted_tensors, sorted_coordinates = zip(*combined_sorted)
+            wsi_emb = torch.stack(sorted_tensors, dim=0).unsqueeze(0)
             input_tensors[mag_level] = wsi_emb
             self.logger.info(f"Mag Level: {mag_level} - Tensor Shape: {wsi_emb.shape}\n")
 
@@ -195,6 +195,7 @@ class TestChild(InlineAlgoQueueProcessor):
         self.diag_model.to("cuda")
         with torch.no_grad():
             logits = self.diag_model(input_tensors)
+            self.logger.info(f"Logits shape: {logits}\n")
             predictions = torch.argmax(logits, dim=1).cpu().numpy()
         self.diag_model.to("cpu")
 

@@ -263,9 +263,9 @@ class ModelArch(nn.Module):
         self.load_state_dict(state_dict)
 
 
-    def forward(self, x5_patches, x10_patches, x20_patches, x40_patches):
+    def forward(self, input_tensors):
 
-        h = x20_patches
+        h = input_tensors[20]
 
         h = self._fc1(h) #[B, n, 512]
 
@@ -273,7 +273,7 @@ class ModelArch(nn.Module):
         H = h.shape[1]
         _H, _W = int(np.ceil(np.sqrt(H))), int(np.ceil(np.sqrt(H)))
         add_length = _H * _W - H
-        h = torch.cat([h, h[:,:add_length,:]],dim = 1) #[B, N, 512]
+        h = torch.cat([h, h[:,:add_length,:]], dim = 1) #[B, N, 512]
 
         #---->cls_token
         B = h.shape[0]
@@ -294,4 +294,4 @@ class ModelArch(nn.Module):
 
         #---->predict
         logits = self._fc2(h) #[B, n_classes]
-        return logits, {}
+        return logits
