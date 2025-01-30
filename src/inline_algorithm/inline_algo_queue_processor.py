@@ -118,9 +118,8 @@ class InlineAlgoQueueProcessor(AbstractInlineAlgorithm):
         :return: A response object with status code 202.
         :rtype: Response
         '''
-        if self.tile_num < 10:
-            self.__queue.put(params)
-            self.tile_num += 1
+        self.__queue.put(params)
+        self.tile_num += 1
         return Response(status_code=202)
 
     async def scan_end(self, params: ScanEnd, request: Request):
